@@ -23,6 +23,7 @@ simplified_network_available = True
 skeletons_available = False
 n_zones = 2
 l1_penalty = 1e-2
+phase2_method = "greedy"  # "milp" or "greedy"
 
 path_prefix = "/home/lorenzo/Documents/Github/proj-mt-schneider"
 solutions_path = "solutions"
@@ -277,17 +278,21 @@ Utils.export_to_kepler(
     city_name,
 )
 
-# ── Phase 2: Cost-minimization MILP on reduced network ─────────────────────────
-# Take the enabled subnetwork and served demand from the LP relaxation, then
-# solve a MILP that minimizes enabling cost while maintaining at least the
-# same total served demand.
+# ── Phase 2: Cost reduction on the enabled subnetwork ──────────────────────────
+# Two methods available (configured via phase2_method):
+#   "milp"   — exact MILP that minimizes enabling cost with binary variables
+#   "greedy" — greedy link pruning by ascending flow, re-solving LP each step
 
 n_od = len(od_count_df)
 enabled_mask = link_sol["enabled"] == 1
 enabled_indices = np.where(enabled_mask.values)[0]
 n_enabled = int(enabled_mask.sum())
+min_demand = served_sol.sum()
 
-logger.info("Phase 2: building min-cost MILP on %d enabled links (out of %d)", n_enabled, n_links)
+logger.info(
+    "Phase 2 (%s): %d enabled links (out of %d), demand floor %.4f",
+    phase2_method, n_enabled, n_links, min_demand,
+)
 
 # Filter link_df to enabled-only subnetwork
 enabled_link_df = link_df[enabled_mask].copy()
@@ -296,16 +301,7 @@ enabled_link_df.reset_index(drop=True, inplace=True)
 # Recompute node-link adjacency on the reduced network (indices must match reset DataFrame)
 enabled_from_to = Utils.get_from_and_to_links_per_node(enabled_link_df, exclude_pt=True)
 
-# Build base model (flow conservation, rebalancing, capacity) on reduced network
-mc_model, mc_served_c, mc_flow_c_l, mc_beta_l = MaximumCustomerCoverage.get_maximum_customer_coverage_model(
-    enabled_link_df,
-    od_count_df,
-    zones_df,
-    enabled_from_to,
-    budget,
-)
-
-# Map LP relaxation solution to reduced network indices for warm start
+# Map LP relaxation solution to reduced network indices
 warm_flow = np.zeros(n_od * n_enabled)
 for i in range(n_od):
     for new_j, old_j in enumerate(enabled_indices):
@@ -313,25 +309,46 @@ for i in range(n_od):
 
 warm_beta = beta_sol[enabled_indices]
 warm_served = served_sol
-min_demand = served_sol.sum()
 
-logger.info("Min demand floor from LP relaxation: %.4f", min_demand)
+if phase2_method == "milp":
+    # Build base model (flow conservation, rebalancing, capacity) on reduced network
+    mc_model, mc_served_c, mc_flow_c_l, mc_beta_l = MaximumCustomerCoverage.get_maximum_customer_coverage_model(
+        enabled_link_df, od_count_df, zones_df, enabled_from_to, budget,
+    )
 
-# Solve cost-minimization MILP with LP solution as warm start
-mc_flow_sol, mc_beta_sol, mc_served_sol, mc_enabled_sol = MaximumCustomerCoverage.solve_min_cost(
-    model=mc_model,
-    served_c=mc_served_c,
-    flow_c_l=mc_flow_c_l,
-    beta_l=mc_beta_l,
-    n_links=n_enabled,
-    n_od_flows=n_od,
-    link_df=enabled_link_df,
-    n_zones=n_zones,
-    min_demand=min_demand,
-    warm_start_flow=warm_flow,
-    warm_start_beta=warm_beta,
-    warm_start_served=warm_served,
-)
+    # Solve cost-minimization MILP with LP solution as warm start
+    mc_flow_sol, mc_beta_sol, mc_served_sol, mc_enabled_sol = MaximumCustomerCoverage.solve_min_cost(
+        model=mc_model,
+        served_c=mc_served_c,
+        flow_c_l=mc_flow_c_l,
+        beta_l=mc_beta_l,
+        n_links=n_enabled,
+        n_od_flows=n_od,
+        link_df=enabled_link_df,
+        n_zones=n_zones,
+        min_demand=min_demand,
+        warm_start_flow=warm_flow,
+        warm_start_beta=warm_beta,
+        warm_start_served=warm_served,
+    )
+
+elif phase2_method == "greedy":
+    # Greedy link pruning: disable links one-by-one (smallest flow first),
+    # re-solving the LP each time to check feasibility.
+    greedy_enabled, mc_flow_sol, mc_beta_sol, mc_served_sol = MaximumCustomerCoverage.greedy_prune(
+        link_df=enabled_link_df,
+        od_count_df=od_count_df,
+        zones_df=zones_df,
+        from_to_links_per_node=enabled_from_to,
+        flow_sol=warm_flow,
+        beta_sol=warm_beta,
+        served_sol=warm_served,
+        n_zones=n_zones,
+    )
+    mc_enabled_sol = greedy_enabled.astype(float)
+
+else:
+    raise ValueError(f"Unknown phase2_method: {phase2_method!r}. Use 'milp' or 'greedy'.")
 
 # ── Phase 2 post-processing and export ─────────────────────────────────────────
 
@@ -360,8 +377,10 @@ logger.info("Phase 2 cost: %s", f"{mc_cost:,.2f}")
 logger.info("Phase 2 served demand: %.4f (floor was %.4f)", mc_served_total, min_demand)
 logger.info("Phase 2 enabled links: %d (of %d in reduced network)", mc_num_enabled, n_enabled)
 
-resume_file_mc = f"{solutions_path}/resume_{city_name}_mincost_zones{n_zones}.txt"
+phase2_label = "mincost" if phase2_method == "milp" else "greedy"
+resume_file_mc = f"{solutions_path}/resume_{city_name}_{phase2_label}_zones{n_zones}.txt"
 with open(resume_file_mc, "w") as f:
+    f.write(f"Method: {phase2_method}\n")
     f.write(f"Cost: {mc_cost}\n")
     f.write(f"Served demand: {mc_served_total}\n")
     f.write(f"Min demand floor: {min_demand}\n")
@@ -369,7 +388,7 @@ with open(resume_file_mc, "w") as f:
     f.write(f"Total links in reduced network: {n_enabled}\n")
 
 Utils.export_to_kepler(
-    f"{solutions_path}/kepler_solution_{city_name}_mincost_{n_zones}_zones.csv",
+    f"{solutions_path}/kepler_solution_{city_name}_{phase2_label}_{n_zones}_zones.csv",
     mc_link_sol[mc_link_sol["enabled"] >= 0.5],
     city_name,
 )

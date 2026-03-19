@@ -14,9 +14,13 @@ The pipeline solves two optimization problems in sequence:
 
 A linear program with continuous enabling variables in [0, 1] maximizes total served passenger trips subject to a budget constraint. An L1 penalty on the enabling variables breaks degeneracy and pushes the solution toward integrality. This phase runs fast via Gurobi's interior point method and identifies which links should carry flow.
 
-### Phase 2 — MILP (min enabling cost)
+### Phase 2 — Cost reduction (min enabling cost)
 
-The network is filtered to only the links enabled in Phase 1. On this reduced network, a mixed-integer linear program with binary enabling variables minimizes total infrastructure cost, subject to the constraint that total served demand must be at least as large as the Phase 1 solution achieved. The Phase 1 solution is used as a warm start (incumbent) for the MILP solver.
+The network is filtered to only the links enabled in Phase 1. On this reduced network, the goal is to disable unnecessary links to reduce total infrastructure cost while maintaining at least the same total served demand. Two methods are available (configured via `phase2_method`):
+
+- **`"milp"`** — A mixed-integer linear program with binary enabling variables minimizes total infrastructure cost exactly. The Phase 1 solution is used as a warm start (incumbent). Gives the optimal solution but can be slow on large networks.
+
+- **`"greedy"`** — A greedy heuristic that iteratively disables links, starting from the one carrying the least flow. After each removal, the LP is re-solved (via warm-started dual simplex) to reroute flow through the remaining links. If the demand floor cannot be met, the link is kept. The algorithm stops when a full pass over all remaining links finds no more to prune. Faster than MILP but produces a heuristic (not necessarily optimal) solution.
 
 Both phases share the same underlying flow model: passenger flow conservation per origin-destination pair, rebalancing (empty vehicle) flow conservation, demand upper bounds, and arc capacity constraints. See `agentic/docs/report.pdf` for the full mathematical formulation.
 
@@ -61,6 +65,7 @@ Edit the configuration variables at the top of `main.py`:
 | `city_name` | City network to use | `"singapore"` |
 | `n_zones` | Number of AV stations | `2` |
 | `l1_penalty` | L1 regularization strength (Phase 1) | `1e-2` |
+| `phase2_method` | Phase 2 method: `"milp"` or `"greedy"` | `"greedy"` |
 | `simplified_network_available` | Use pre-simplified network | `True` |
 | `skeletons_available` | Use skeleton-pruned network | `False` |
 
@@ -79,9 +84,9 @@ Results are written to `solutions/`:
 | File | Contents |
 |---|---|
 | `kepler_solution_*_relaxed_*_zones.csv` | Phase 1: enabled links from LP relaxation |
-| `kepler_solution_*_mincost_*_zones.csv` | Phase 2: enabled links from cost-minimization MILP |
+| `kepler_solution_*_{mincost,greedy}_*_zones.csv` | Phase 2: enabled links after cost reduction |
 | `resume_*_relaxed_zones*.txt` | Phase 1 summary: cost, L1 penalty, enabled link counts at various thresholds |
-| `resume_*_mincost_zones*.txt` | Phase 2 summary: cost, served demand, demand floor, enabled link counts |
+| `resume_*_{mincost,greedy}_zones*.txt` | Phase 2 summary: method, cost, served demand, demand floor, enabled link counts |
 | `*_stations.csv` | Station (zone center) locations |
 
 All output CSVs include lat/lon columns for visualization in [Kepler.gl](https://kepler.gl/). Gurobi model artifacts (`.sol`, `.lp`) are written to the project root (gitignored).
@@ -90,7 +95,7 @@ All output CSVs include lat/lon columns for visualization in [Kepler.gl](https:/
 
 ```
 main.py                      Pipeline orchestrator (data loading, two-phase solve, export)
-MaximumCustomerCoverage.py   Gurobi optimization models (LP relaxation + cost-minimization MILP)
+MaximumCustomerCoverage.py   Gurobi optimization models (LP relaxation, MILP, greedy pruning)
 Utils.py                     Network processing, spatial ops, data preparation
 data/                        Input data (gitignored)
 solutions/                   Output solutions (gitignored)
@@ -105,8 +110,10 @@ agentic/docs/report.pdf      Semester thesis with full problem formulation
 4. **Build demand** — Computes origin-destination trip counts between zone pairs, filtering self-loops.
 5. **Scale** — Divides costs, capacities, and demand by scaling factors for numerical stability.
 6. **Phase 1: LP relaxation** — Builds the base flow model on the full network. Adds continuous enabling variables, linking constraints, budget constraint, and L1 penalty. Maximizes served trips via interior point method.
-7. **Phase 2: Cost-minimization MILP** — Filters the network to only Phase 1 enabled links. Rebuilds the flow model on this reduced network. Adds binary enabling variables and a demand floor constraint (served trips >= Phase 1 total). Minimizes total enabling cost using the Phase 1 solution as a warm start.
-8. **Export** — Writes both solutions (relaxed and min-cost) to CSV for Kepler.gl visualization, along with summary statistics.
+7. **Phase 2: Cost reduction** — Filters the network to only Phase 1 enabled links. Depending on `phase2_method`:
+   - *MILP*: Rebuilds the flow model, adds binary enabling variables and a demand floor (served >= Phase 1 total), minimizes cost with Phase 1 warm start.
+   - *Greedy*: Builds the flow model with a demand floor, then iteratively disables links (smallest flow first), re-solving the LP via dual simplex each step. Stops when no more links can be pruned.
+8. **Export** — Writes both solutions to CSV for Kepler.gl visualization, along with summary statistics.
 
 ## References
 

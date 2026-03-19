@@ -197,6 +197,133 @@ def solve_min_cost(
     return flow_sol, beta_sol, served_sol, enabled_sol
 
 
+def greedy_prune(
+    link_df: pd.DataFrame,
+    od_count_df: pd.DataFrame,
+    zones_df: pd.DataFrame,
+    from_to_links_per_node: pd.DataFrame,
+    flow_sol: np.ndarray,
+    beta_sol: np.ndarray,
+    served_sol: np.ndarray,
+    n_zones: int,
+):
+    """
+    Greedily disable links to reduce total enabling cost.
+
+    Starting from the enabled subnetwork and its flow solution, the algorithm
+    iteratively:
+      1. Sorts enabled links by total flow (ascending, cheapest to reroute first).
+      2. Tentatively disables the link with the smallest flow by setting its
+         capacity constraint RHS to 0.
+      3. Re-solves the LP (maximize served trips with a demand floor) to check
+         if flows can be rerouted through remaining links.
+      4. If feasible (demand floor met): keeps the link disabled and uses the
+         new flow solution for the next iteration.
+      5. If infeasible: restores the link and tries the next candidate.
+    The algorithm stops when a full pass over all remaining links produces no
+    further pruning.
+
+    Uses dual simplex (Method=1) for efficient warm-started re-solves, since
+    each iteration only changes one constraint RHS.
+
+    Returns (enabled_mask, flow_sol, beta_sol, served_sol) where enabled_mask
+    is a boolean array over the input link_df indices.
+    """
+    n_links = len(link_df)
+    n_od = len(od_count_df)
+    min_demand = served_sol.sum()
+
+    logger.info("Greedy pruning: %d links, demand floor %.4f", n_links, min_demand)
+
+    # Build base model on the enabled subnetwork
+    model, served_c, flow_c_l, beta_l = get_maximum_customer_coverage_model(
+        link_df, od_count_df, zones_df, from_to_links_per_node, 0.0,
+    )
+
+    # Add demand floor constraint
+    model.addConstr(served_c.sum() >= min_demand, "demand_floor")
+
+    # Use dual simplex for efficient re-solves with warm start
+    model.setParam("Method", 1)
+    # Suppress per-solve log output (we log progress ourselves)
+    model.setParam("OutputFlag", 0)
+    model.update()
+
+    # Solve once to establish a feasible basis
+    model.optimize()
+    if model.Status not in (GRB.OPTIMAL, GRB.SUBOPTIMAL):
+        logger.warning("Initial greedy solve infeasible (status %d), returning input as-is", model.Status)
+        return np.ones(n_links, dtype=bool), flow_sol, beta_sol, served_sol
+
+    # Initialize from the solved model
+    current_flow = flow_c_l.getAttr("X")
+    current_beta = beta_l.getAttr("X")
+    current_served = served_c.getAttr("X")
+    capacities = link_df.capacity.values
+
+    enabled = np.ones(n_links, dtype=bool)
+
+    iteration = 0
+    while True:
+        iteration += 1
+
+        # Compute total flow per enabled link
+        total_flow = np.zeros(n_links)
+        for l in np.where(enabled)[0]:
+            pax_flow = sum(current_flow[i * n_links + l] for i in range(n_od))
+            total_flow[l] = pax_flow + current_beta[l]
+
+        # Sort enabled links by total flow ascending (try removing low-flow links first)
+        candidates = np.where(enabled)[0]
+        candidates = candidates[np.argsort(total_flow[candidates])]
+
+        pruned_any = False
+        for l in candidates:
+            # Tentatively disable link by setting capacity to 0
+            constr = model.getConstrByName(f"capFlow_{l}")
+            original_rhs = constr.RHS
+            constr.RHS = 0.0
+            model.update()
+
+            model.optimize()
+
+            if model.Status in (GRB.OPTIMAL, GRB.SUBOPTIMAL):
+                new_served_total = served_c.getAttr("X").sum()
+                if new_served_total >= min_demand - 1e-6:
+                    # Pruning successful: keep link disabled, update flow solution
+                    enabled[l] = False
+                    current_flow = flow_c_l.getAttr("X")
+                    current_beta = beta_l.getAttr("X")
+                    current_served = served_c.getAttr("X")
+                    remaining = int(enabled.sum())
+                    cost = (enabled * link_df.enabling_cost.values).sum()
+                    logger.info(
+                        "Iteration %d: pruned link %d (flow=%.4f), "
+                        "%d links remaining, cost=%.2f",
+                        iteration, l, total_flow[l], remaining, cost,
+                    )
+                    pruned_any = True
+                    # Restart with recomputed flows
+                    break
+                else:
+                    # Demand not met, restore link
+                    constr.RHS = original_rhs
+                    model.update()
+            else:
+                # Infeasible, restore link
+                constr.RHS = original_rhs
+                model.update()
+
+        if not pruned_any:
+            logger.info(
+                "Greedy pruning complete after %d iterations: %d links remaining (pruned %d)",
+                iteration, int(enabled.sum()), n_links - int(enabled.sum()),
+            )
+            break
+
+    return enabled, current_flow, current_beta, current_served
+
+
 def get_maximum_customer_coverage_model(
     links_df: pd.DataFrame,
     od_count_df: pd.DataFrame,
