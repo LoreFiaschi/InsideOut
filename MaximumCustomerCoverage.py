@@ -103,6 +103,100 @@ def solve_relaxed(
     return flow_sol, beta_sol, served_sol, enabled_sol
 
 
+def solve_min_cost(
+    model: gp.Model,
+    served_c,       # gp.MVar shape (n_od,)
+    flow_c_l,       # gp.MVar shape (n_od * n_links,)
+    beta_l,         # gp.MVar shape (n_links,)
+    n_links: int,
+    n_od_flows: int,
+    link_df: pd.DataFrame,
+    n_zones: int,
+    min_demand: float,
+    warm_start_flow: np.ndarray,
+    warm_start_beta: np.ndarray,
+    warm_start_served: np.ndarray,
+):
+    """
+    Solve the cost-minimization MILP on a reduced (enabled-only) network.
+
+    This is the second-phase problem: given that the LP relaxation identified
+    which links to enable, find the minimum-cost binary enabling that still
+    serves at least `min_demand` total trips.
+
+    Differences from the LP relaxation (solve_relaxed):
+      - Enabling variables are binary (0/1), not continuous.
+      - Objective minimizes total enabling cost (not maximizes served trips).
+      - A demand floor constraint replaces the budget constraint:
+        sum(served_c) >= min_demand.
+      - The LP relaxation solution is used as a warm start (incumbent).
+
+    Returns (flow_sol, beta_sol, served_sol, enabled_sol) as numpy arrays.
+    """
+    # Add binary enabling variables for each link
+    enabled_l = model.addMVar(
+        (n_links,), name="enabled_links", vtype=GRB.BINARY
+    )
+
+    # Objective: minimize total enabling cost
+    model.ModelSense = GRB.MINIMIZE
+    model.setObjective(gp.quicksum(enabled_l * link_df.enabling_cost.values))
+    model.update()
+    logger.info("Objective set to minimize total enabling cost")
+
+    capacities = link_df.capacity.values
+    link_offset_per_od = np.arange(0, n_od_flows) * n_links
+
+    # Linking and capacity constraints for each link
+    num_constraints = 0
+    for l in tqdm(range(n_links), desc="Linking constraints (min-cost)"):
+        total_flow = gp.quicksum(flow_c_l[l + link_offset_per_od]) + beta_l[l]
+
+        # Lower bound: if there is flow, the link must be enabled
+        model.addConstr(total_flow >= enabled_l[l], f"bigMLower_{l}")
+        num_constraints += 1
+
+        # Upper bound: flow cannot exceed enabled * capacity
+        model.addConstr(total_flow <= enabled_l[l] * capacities[l], f"capFlow_{l}")
+        num_constraints += 1
+
+    logger.info("Added %d linking/capacity constraints", num_constraints)
+
+    # Demand floor: total served trips must be at least min_demand
+    model.addConstr(served_c.sum() >= min_demand, "demand_floor")
+    logger.info("Demand floor constraint added: served >= %.4f", min_demand)
+
+    # Warm start from LP relaxation solution
+    flow_c_l.setAttr("Start", warm_start_flow)
+    beta_l.setAttr("Start", warm_start_beta)
+    served_c.setAttr("Start", warm_start_served)
+    enabled_l.setAttr("Start", np.ones(n_links))  # all links enabled in reduced network
+    model.update()
+    logger.info("Warm start set from LP relaxation solution")
+
+    # Solve
+    logger.info("Starting min-cost MILP solve")
+    model.optimize()
+
+    if model.Status not in (GRB.OPTIMAL, GRB.SUBOPTIMAL):
+        status_map = {
+            GRB.INFEASIBLE: "Problem not feasible",
+            GRB.UNBOUNDED: "Problem unbounded",
+            GRB.UNDEFINED: "Problem undefined",
+        }
+        msg = status_map.get(model.Status, f"Solver status {model.Status}")
+        raise RuntimeError(msg)
+
+    model.write(f"mcc_model_solved_mincost_zone{n_zones}.sol")
+
+    flow_sol = flow_c_l.getAttr("X")
+    beta_sol = beta_l.getAttr("X")
+    served_sol = served_c.getAttr("X")
+    enabled_sol = enabled_l.getAttr("X")
+
+    return flow_sol, beta_sol, served_sol, enabled_sol
+
+
 def get_maximum_customer_coverage_model(
     links_df: pd.DataFrame,
     od_count_df: pd.DataFrame,

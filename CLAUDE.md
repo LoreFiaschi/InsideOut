@@ -45,12 +45,14 @@ Three Python files, no package structure:
 3. Clusters trip origins into `n_zones` stations via k-means
 4. Builds OD (origin-destination) demand matrix
 5. Calls `MaximumCustomerCoverage.get_maximum_customer_coverage_model()` to build the base Gurobi model
-6. Solves via `MaximumCustomerCoverage.solve_relaxed()` (LP relaxation with L1 penalty)
-7. Exports enabled-link solutions to CSV for Kepler.gl visualization
+6. **Phase 1**: Solves via `solve_relaxed()` (LP relaxation with L1 penalty) — maximizes served trips under budget
+7. **Phase 2**: Filters to enabled-only subnetwork, rebuilds the model, solves via `solve_min_cost()` — minimizes enabling cost while maintaining at least the LP-relaxation served demand
+8. Exports both solutions to CSV for Kepler.gl visualization
 
 ### `MaximumCustomerCoverage.py` — Gurobi optimization model
 - `get_maximum_customer_coverage_model()` builds the base LP without budget/enabling constraints: flow conservation per OD pair per node, rebalancing flow conservation, capacity constraints. Returns the model plus variable handles (`served_c`, `flow_c_l`, `beta_l`).
-- `solve_relaxed()` adds continuous `enabled_l` variables in [0,1], linking/capacity constraints, budget constraint, and L1 penalty. Uses interior point (Method=2, Crossover=0).
+- `solve_relaxed()` (Phase 1) adds continuous `enabled_l` variables in [0,1], linking/capacity constraints, budget constraint, and L1 penalty. Uses interior point (Method=2, Crossover=0).
+- `solve_min_cost()` (Phase 2) adds binary `enabled_l` variables, minimizes total enabling cost subject to a demand floor (>= LP served demand). Uses LP solution as warm start.
 
 ### `Utils.py` — Data processing
 Network loading, coordinate transforms (EPSG:3414 ↔ WGS84 for Singapore, EPSG:31468 ↔ WGS84 for Berlin), SCC extraction via NetworkX, degree-1 node contraction, trip origin/destination extraction from MATSim plans, k-means zone creation, OD count aggregation, Kepler.gl CSV export.

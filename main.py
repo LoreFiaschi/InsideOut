@@ -270,9 +270,106 @@ with open(resume_file, "w") as f:
     f.write(f"Total enabled value sum: {total_enabled_sum:,.2f}\n")
     logger.info("Total enabled value sum: %s", f"{total_enabled_sum:,.2f}")
 
-# Export enabled links to Kepler.gl
+# Export LP relaxation enabled links to Kepler.gl
 Utils.export_to_kepler(
     f"{solutions_path}/kepler_solution_{city_name}_relaxed_{n_zones}_zones.csv",
     link_sol[link_sol["enabled"] == 1],
+    city_name,
+)
+
+# ── Phase 2: Cost-minimization MILP on reduced network ─────────────────────────
+# Take the enabled subnetwork and served demand from the LP relaxation, then
+# solve a MILP that minimizes enabling cost while maintaining at least the
+# same total served demand.
+
+n_od = len(od_count_df)
+enabled_mask = link_sol["enabled"] == 1
+enabled_indices = np.where(enabled_mask.values)[0]
+n_enabled = int(enabled_mask.sum())
+
+logger.info("Phase 2: building min-cost MILP on %d enabled links (out of %d)", n_enabled, n_links)
+
+# Filter link_df to enabled-only subnetwork
+enabled_link_df = link_df[enabled_mask].copy()
+enabled_link_df.reset_index(drop=True, inplace=True)
+
+# Recompute node-link adjacency on the reduced network (indices must match reset DataFrame)
+enabled_from_to = Utils.get_from_and_to_links_per_node(enabled_link_df, exclude_pt=True)
+
+# Build base model (flow conservation, rebalancing, capacity) on reduced network
+mc_model, mc_served_c, mc_flow_c_l, mc_beta_l = MaximumCustomerCoverage.get_maximum_customer_coverage_model(
+    enabled_link_df,
+    od_count_df,
+    zones_df,
+    enabled_from_to,
+    budget,
+)
+
+# Map LP relaxation solution to reduced network indices for warm start
+warm_flow = np.zeros(n_od * n_enabled)
+for i in range(n_od):
+    for new_j, old_j in enumerate(enabled_indices):
+        warm_flow[i * n_enabled + new_j] = flow_sol[i * n_links + old_j]
+
+warm_beta = beta_sol[enabled_indices]
+warm_served = served_sol
+min_demand = served_sol.sum()
+
+logger.info("Min demand floor from LP relaxation: %.4f", min_demand)
+
+# Solve cost-minimization MILP with LP solution as warm start
+mc_flow_sol, mc_beta_sol, mc_served_sol, mc_enabled_sol = MaximumCustomerCoverage.solve_min_cost(
+    model=mc_model,
+    served_c=mc_served_c,
+    flow_c_l=mc_flow_c_l,
+    beta_l=mc_beta_l,
+    n_links=n_enabled,
+    n_od_flows=n_od,
+    link_df=enabled_link_df,
+    n_zones=n_zones,
+    min_demand=min_demand,
+    warm_start_flow=warm_flow,
+    warm_start_beta=warm_beta,
+    warm_start_served=warm_served,
+)
+
+# ── Phase 2 post-processing and export ─────────────────────────────────────────
+
+mc_link_sol = enabled_link_df.copy()
+
+for i in range(n_od):
+    mc_link_sol[f"paxFlow_{i}"] = cap_scale * mc_flow_sol[i * n_enabled : (i + 1) * n_enabled]
+
+mc_link_sol["rebalFlow"] = cap_scale * mc_beta_sol
+mc_link_sol["enabled"] = mc_enabled_sol
+
+# Restore original enabling costs (look up from link_df_prior by link_id)
+mc_link_sol = mc_link_sol.merge(
+    link_df_prior[["link_id", "enabling_cost"]].rename(columns={"enabling_cost": "enabling_cost_orig"}),
+    on="link_id",
+    how="left",
+)
+mc_link_sol["enabling_cost"] = mc_link_sol["enabling_cost_orig"]
+mc_link_sol.drop(columns=["enabling_cost_orig"], inplace=True)
+
+mc_cost = (mc_link_sol["enabled"] * mc_link_sol.enabling_cost.values).sum()
+mc_served_total = mc_served_sol.sum()
+mc_num_enabled = int(mc_enabled_sol.sum())
+
+logger.info("Phase 2 cost: %s", f"{mc_cost:,.2f}")
+logger.info("Phase 2 served demand: %.4f (floor was %.4f)", mc_served_total, min_demand)
+logger.info("Phase 2 enabled links: %d (of %d in reduced network)", mc_num_enabled, n_enabled)
+
+resume_file_mc = f"{solutions_path}/resume_{city_name}_mincost_zones{n_zones}.txt"
+with open(resume_file_mc, "w") as f:
+    f.write(f"Cost: {mc_cost}\n")
+    f.write(f"Served demand: {mc_served_total}\n")
+    f.write(f"Min demand floor: {min_demand}\n")
+    f.write(f"Number of enabled links: {mc_num_enabled}\n")
+    f.write(f"Total links in reduced network: {n_enabled}\n")
+
+Utils.export_to_kepler(
+    f"{solutions_path}/kepler_solution_{city_name}_mincost_{n_zones}_zones.csv",
+    mc_link_sol[mc_link_sol["enabled"] >= 0.5],
     city_name,
 )
